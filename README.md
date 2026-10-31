@@ -92,4 +92,3 @@ Read the [changelog](CHANGELOG.md) for version history.
 Derived from [GE Appliances' SmartHQ integration](https://github.com/geappliances/geappliances-smarthq-integration), based on commit `6e52439b1366a4edb77118ae446c11bf6e0570d3`. The original BSD-3-Clause copyright notice and license are retained in [LICENSE](LICENSE); the original documentation is retained in [UPSTREAM_README.md](UPSTREAM_README.md).
 
 Product names and artwork belong to their respective owners. The included Sidekick artwork comes from the [product website](https://www.sourdoughsidekick.com/); its use here identifies the device and does not imply endorsement.
-

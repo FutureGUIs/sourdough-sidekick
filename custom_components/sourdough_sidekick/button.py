@@ -1,0 +1,809 @@
+"""Button platform for SmartHQ integration.
+
+Entity registration is driven entirely by coordinator.data[device_id]["item"]["services"].
+
+Service → entity mapping:
+  trigger                          → SmartHQTriggerButton   (trigger.do)
+  firmware.v1 + CMD_FIRMWARE_UPGRADE → SmartHQFirmwareUpgradeButton
+  temperature (refrigerator.hotwater) → SmartHQHotWaterPresetButton (Cocoa/Tea/Soup)
+  coffeebrewer.v1/.v2              → SmartHQCoffeeBrewerButton (start + stop)
+  cooking.mode.v1 (with food doms) → SmartHQStartCookingButton (send pending params)
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Set
+
+from homeassistant.components.button import ButtonEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import DOMAIN, MANUFACTURER, DEFAULT_NAME, sdev_prefix
+from .dispatcher import SIGNAL_DEVICE_UPDATED
+from .service_registry import (
+    TRIGGER_SERVICE,
+    FIRMWARE_SERVICE,
+    TEMPERATURE_SERVICE,
+    CMD_TEMPERATURE_SET,
+    COFFEEBREWER_V1_SERVICE,
+    COFFEEBREWER_V2_SERVICE,
+    COOKING_MODE_SERVICE,
+    is_cooking_mode_domain,
+    DISHWASHER_STATE_V1_SERVICE,
+    DISHDRAWER_STATE_LEGACY_SERVICE,
+    CMD_TRIGGER_DO,
+    CMD_FIRMWARE_UPGRADE,
+    CMD_COOKING_MODE_SET,
+    CMD_COOKING_MODE_START,
+    CMD_DISHWASHER_STATE_START,
+    CMD_DISHWASHER_STATE_STOP,
+    CMD_DISHWASHER_STATE_PAUSE,
+    CMD_DISHDRAWER_STATE_LEGACY_START,
+    CMD_DISHDRAWER_STATE_LEGACY_STOP,
+    CMD_DISHDRAWER_STATE_LEGACY_PAUSE,
+    COOKING_ADVANTIUM_SERVICE,
+    CMD_ADVANTIUM_START,
+    CMD_ADVANTIUM_STOP,
+    CMD_ADVANTIUM_PAUSE,
+    CMD_ADVANTIUM_RESUME,
+    MIXER_SERVICE,
+    CMD_MIXER_CANCEL,
+    CMD_MIXER_PAUSE,
+    make_unique_id,
+    get_service_mapping,
+    is_platform_mapped,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data-driven WS button specs
+# Each entry maps a serviceType → list of (label, cmd, uid_sfx, icon) buttons.
+# cls "DW"  → SmartHQDishwasherStateButton(ws, label, cmd, uid)
+# cls "ADV" → SmartHQAdvantiumButton(ws, label, cmd, icon, uid)
+# label_prefix is prepended to each button label (e.g. "Dishdrawer ").
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass as _dc, field as _field
+
+@_dc
+class _WBSpec:
+    buttons: list   # list of (label, cmd, uid_sfx, icon)
+    cls: str        # "DW" or "ADV"
+    label_prefix: str = ""
+
+
+_WS_BUTTON_SPECS: dict[str, _WBSpec] = {
+    DISHWASHER_STATE_V1_SERVICE: _WBSpec(cls="DW", buttons=[
+        ("Start", CMD_DISHWASHER_STATE_START, "dw_start",  ""),
+        ("Stop",  CMD_DISHWASHER_STATE_STOP,  "dw_stop",   ""),
+        ("Pause", CMD_DISHWASHER_STATE_PAUSE, "dw_pause",  ""),
+    ]),
+    DISHDRAWER_STATE_LEGACY_SERVICE: _WBSpec(cls="DW", label_prefix="Dishdrawer ", buttons=[
+        ("Start", CMD_DISHDRAWER_STATE_LEGACY_START, "ddr_start", ""),
+        ("Stop",  CMD_DISHDRAWER_STATE_LEGACY_STOP,  "ddr_stop",  ""),
+        ("Pause", CMD_DISHDRAWER_STATE_LEGACY_PAUSE, "ddr_pause", ""),
+    ]),
+    COOKING_ADVANTIUM_SERVICE: _WBSpec(cls="ADV", buttons=[
+        ("Start",  CMD_ADVANTIUM_START,  "adv_start",  "mdi:play"),
+        ("Stop",   CMD_ADVANTIUM_STOP,   "adv_stop",   "mdi:stop"),
+        ("Pause",  CMD_ADVANTIUM_PAUSE,  "adv_pause",  "mdi:pause"),
+        ("Resume", CMD_ADVANTIUM_RESUME, "adv_resume", "mdi:play-pause"),
+    ]),
+    MIXER_SERVICE: _WBSpec(cls="ADV", buttons=[
+        ("Cancel", CMD_MIXER_CANCEL, "mixer_cancel", "mdi:stop"),
+        ("Pause",  CMD_MIXER_PAUSE,  "mixer_pause",  "mdi:pause"),
+    ]),
+}
+
+
+# ---------------------------------------------------------------------------
+# Store helpers
+# ---------------------------------------------------------------------------
+
+def _bucket(hass, entry):
+    return hass.data.get(DOMAIN, {}).get(entry.entry_id) or {}
+
+def _store(hass, entry):
+    return _bucket(hass, entry).get("store") or {}
+
+def _dev_payload(hass, entry, device_id):
+    return _store(hass, entry).get(device_id) or {}
+
+def _snapshot_for(hass, entry, device_id):
+    return _dev_payload(hass, entry, device_id).get("snapshot") or {}
+
+def _device_info_for(hass, entry, device_id):
+    info = _dev_payload(hass, entry, device_id).get("info") or {}
+    name = info.get("nickname") or info.get("name") or DEFAULT_NAME
+    model = info.get("model") or info.get("deviceType") or ""
+    sw_version = info.get("firmwareRevision") or ""
+    return {
+        "identifiers": {(DOMAIN, device_id)},
+        "manufacturer": MANUFACTURER,
+        "name": name,
+        "model": model,
+        "sw_version": sw_version,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Platform setup
+# ---------------------------------------------------------------------------
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up SmartHQ button entities from coordinator service definitions."""
+    bucket = _bucket(hass, entry)
+    coordinator = bucket.get("coordinator")
+    client = bucket.get("client")
+    api = bucket.get("api")
+
+    if not coordinator or not coordinator.data:
+        _LOGGER.warning("[BUTTON] Coordinator data not available yet")
+        return
+
+    entities: List[ButtonEntity] = []
+
+    for device_id, device_item in coordinator.data.items():
+        item = device_item.get("item") or {}
+        services_list = item.get("services") or []
+        if not isinstance(services_list, list):
+            continue
+
+        info = device_item.get("info") or {}
+        dev_name = info.get("nickname") or info.get("name") or DEFAULT_NAME
+
+        # Detect cooking.mode.v1 food-domain services for StartCookingButton
+        has_cooking_mode = False
+        # True when device has probe-based cooking (Smoker-style: cooking.food.*)
+        has_probe_mode = False
+
+        for svc in services_list:
+            if not isinstance(svc, dict):
+                continue
+
+            stype = svc.get("serviceType") or ""
+            dom = svc.get("domainType") or ""
+            service_id = svc.get("id") or svc.get("serviceId") or ""
+            cmds = svc.get("supportedCommands") or []
+
+            # ── Allowlist check ──
+            if get_service_mapping(stype) is None:
+                _LOGGER.debug("[BUTTON] Skipping unmapped serviceType=%s", stype)
+                continue
+            if not is_platform_mapped(stype, "button"):
+                continue
+
+            # ── trigger → button ────────────────────────────────────
+            if stype == TRIGGER_SERVICE:
+                label = dom.split(".")[-1].replace("_", " ").title() if dom else "Trigger"
+                # Factory reset and restore-defaults are dangerous operations
+                # that should never be exposed in HA UI. Block entirely.
+                _is_dangerous = any(
+                    kw in dom for kw in ("factory", "restore")
+                )
+                if _is_dangerous:
+                    _LOGGER.debug("[BUTTON] Blocking dangerous trigger domain=%s", dom)
+                    continue
+                entities.append(SmartHQTriggerButton(
+                    hass=hass, entry=entry, client=client,
+                    device_id=device_id, service_id=service_id,
+                    dev_name=dev_name, label=label, svc=svc,
+                    unique_id=make_unique_id(device_id, service_id, "trigger"),
+                ))
+
+            # ── firmware upgrade → button ───────────────────────────────────
+            # Firmware upgrades are managed via the HA update entity or the
+            # SmartHQ app; exposing a raw trigger button is unsafe and confusing.
+            elif stype == FIRMWARE_SERVICE:
+                _LOGGER.debug("[BUTTON] Blocking firmware trigger for %s", device_id[:8])
+                continue
+
+            # ── refrigerator hot water: beverage temperature presets ────────
+            # There is no separate "start heating" command — sending
+            # temperature.set with the target fahrenheit value both sets the
+            # setpoint and starts heating (confirmed with the App team). These
+            # buttons are a shortcut for the app's Cocoa/Tea/Soup quick-picks.
+            elif (
+                stype == TEMPERATURE_SERVICE
+                and CMD_TEMPERATURE_SET in cmds
+                and "hotwater" in (svc.get("serviceDeviceType") or "")
+            ):
+                prefix = sdev_prefix(svc.get("serviceDeviceType") or "") or "Hot Water"
+                for preset_name, preset_f, icon in (
+                    ("Cocoa", 150, "mdi:coffee"),
+                    ("Tea", 170, "mdi:tea"),
+                    ("Soup", 185, "mdi:pot-steam"),
+                ):
+                    entities.append(SmartHQHotWaterPresetButton(
+                        hass=hass, entry=entry, client=client,
+                        device_id=device_id, service_id=service_id,
+                        dev_name=dev_name, label=f"{prefix} {preset_name} Preset",
+                        fahrenheit=preset_f, icon=icon,
+                        unique_id=make_unique_id(device_id, service_id, f"hotwater_preset_{preset_name.lower()}"),
+                    ))
+
+            # ── coffee brewer start/stop ────────────────────────────────────
+            elif stype in (COFFEEBREWER_V1_SERVICE, COFFEEBREWER_V2_SERVICE):
+                version = "v1" if stype == COFFEEBREWER_V1_SERVICE else "v2"
+                for btn_type in ("start", "stop"):
+                    cmd = f"cloud.smarthq.command.coffeebrewer.{version}.{btn_type}"
+                    entities.append(SmartHQCoffeeBrewerButton(
+                        hass=hass, entry=entry, api=api,
+                        device_id=device_id, service_id=service_id,
+                        dev_name=dev_name, command_type=cmd, button_type=btn_type,
+                        unique_id=make_unique_id(device_id, service_id, f"brew_{btn_type}"),
+                    ))
+
+            # ── cooking.mode.v1 (any startable cooking domain) → start cooking button
+            # Covers Smoker (food.*), Toaster Oven (bake/airfry/toast…), Oven, Microwave
+            elif stype == COOKING_MODE_SERVICE:
+                if is_cooking_mode_domain(dom):
+                    has_cooking_mode = True
+                    # Smoker-style: probe-based cooking (cooking.food.*)
+                    if "cooking.food." in dom:
+                        has_probe_mode = True
+
+            # ── dishwasher/dishdrawer/advantium/mixer WS buttons (data-driven) ──
+            elif stype in _WS_BUTTON_SPECS:
+                ws = bucket.get("client") or bucket.get("ws")
+                if ws:
+                    spec = _WS_BUTTON_SPECS[stype]
+                    for btn_label, cmd_type, uid_sfx, icon in spec.buttons:
+                        if cmd_type in cmds:
+                            label = f"{spec.label_prefix}{btn_label}"
+                            if spec.cls == "ADV":
+                                entities.append(SmartHQAdvantiumButton(
+                                    hass=hass, entry=entry, ws=ws,
+                                    device_id=device_id, service_id=service_id,
+                                    dev_name=dev_name, label=label,
+                                    command_type=cmd_type, icon=icon,
+                                    unique_id=make_unique_id(device_id, service_id, uid_sfx),
+                                ))
+                            else:
+                                entities.append(SmartHQDishwasherStateButton(
+                                    hass=hass, entry=entry, ws=ws,
+                                    device_id=device_id, service_id=service_id,
+                                    dev_name=dev_name, label=label,
+                                    command_type=cmd_type,
+                                    unique_id=make_unique_id(device_id, service_id, uid_sfx),
+                                ))
+
+        # One cooking start button per device that has cooking.mode.v1 startable services
+        if has_cooking_mode:
+            entities.append(SmartHQStartCookingButton(
+                hass=hass, entry=entry, client=client,
+                device_id=device_id, dev_name=dev_name,
+                is_smoker_style=has_probe_mode,
+                unique_id=make_unique_id(device_id, device_id, "start_cooking"),
+            ))
+
+    _LOGGER.info("[BUTTON] Registering %d button entities", len(entities))
+    if entities:
+        async_add_entities(entities, update_before_add=False)
+
+
+# ---------------------------------------------------------------------------
+# Entity classes
+# ---------------------------------------------------------------------------
+
+class _SmartHQButtonBase(ButtonEntity):
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+
+    def __init__(self, hass, entry, device_id, dev_name, unique_id):
+        self.hass = hass
+        self._entry = entry
+        self._device_id = device_id
+        self._attr_unique_id = unique_id
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to WS device updates so available/state re-evaluates."""
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                SIGNAL_DEVICE_UPDATED.format(device_id=self._device_id),
+                self.async_write_ha_state,
+            )
+        )
+
+    @property
+    def device_info(self):
+        return _device_info_for(self.hass, self._entry, self._device_id)
+
+
+class SmartHQTriggerButton(_SmartHQButtonBase):
+    """Button for a trigger service — sends trigger.do with no parameters.
+
+    entity_category is intentionally NOT set (None) so that user-facing
+    triggers like 'Start' appear in the Controls section, not Diagnostics.
+    Factory/restore triggers are disabled by default via the registry flag.
+    """
+
+    _attr_icon = "mdi:gesture-tap-button"
+
+    def __init__(self, hass, entry, client, device_id, service_id,
+                 dev_name, label, svc, unique_id):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._client = client
+        self._service_id = service_id
+        self._svc = svc  # full service dict for async_send_service_command
+        self._attr_name = f"{dev_name} {label}"
+
+    def _device_presence(self) -> str:
+        """Return device presence status string (e.g. 'ONLINE', 'OFFLINE')."""
+        payload = _dev_payload(self.hass, self._entry, self._device_id)
+        pres = payload.get("presence") or {}
+        # The presence dict may use 'presence' or 'status' as the key
+        return str(pres.get("presence") or pres.get("status") or "UNKNOWN").upper()
+
+    @property
+    def available(self) -> bool:
+        """Mirror the GE SmartHQ app behaviour for trigger buttons.
+
+        For washer/dryer (devices that have a laundry.state.v1 service):
+          - Available ONLY when runStatus == "cloud.smarthq.type.runstatus.delayed"
+            (= Remote Start armed on panel + cycle queued for delayed/remote start).
+          - All other runStatus values (running, idle, paused…) → unavailable.
+          This exactly matches what the GE SmartHQ app shows.
+
+        For other devices (coffee brewer, dishwasher, etc.) that have no
+        laundry state service, fall back to the service-level ``disabled`` flag.
+        """
+        # 1. Device must be ONLINE (or unknown yet — optimistic)
+        status = self._device_presence()
+        if status not in ("ONLINE", "UNKNOWN"):
+            return False
+
+        snap = _snapshot_for(self.hass, self._entry, self._device_id)
+        services = snap.get("services") or {}
+        index = snap.get("index") or {}
+
+        # 2. Laundry device: use runStatus as the availability gate
+        #    - domain.start  → available only when runStatus == delayed
+        #    - domain.stop   → available only when runStatus == running
+        _LAUNDRY_STATE_STYPE = "cloud.smarthq.service.laundry.state.v1"
+        _LAUNDRY_DOM = "cloud.smarthq.domain.laundry"
+        laundry_sid = index.get((_LAUNDRY_STATE_STYPE, _LAUNDRY_DOM))
+        _LOGGER.debug(
+            "[TRIGGER_AVAIL] %s svc=%s index_keys=%s laundry_sid=%s",
+            self._device_id[:8], self._service_id[:8] if self._service_id else "?",
+            list(index.keys())[:5], laundry_sid,
+        )
+        if laundry_sid:
+            laundry_st = services.get(laundry_sid) or {}
+            run_status = laundry_st.get("runStatus", "")
+            svc_state = services.get(self._service_id) or {}
+            domain = svc_state.get("domainType", "")
+            _LOGGER.debug(
+                "[TRIGGER_AVAIL] run_status=%s domain=%s",
+                run_status, domain,
+            )
+            # runStatus values known to indicate machine is idle / not started:
+            _INACTIVE = {
+                "cloud.smarthq.type.runstatus.standby",
+                "cloud.smarthq.type.runstatus.idle",
+                "cloud.smarthq.type.runstatus.off",
+                "",
+            }
+            if domain.endswith(".stop"):
+                # Stop is available whenever the machine is NOT idle/standby/delayed
+                return run_status not in _INACTIVE and run_status != "cloud.smarthq.type.runstatus.delayed"
+            # Start: only when Remote Start is armed (delayed)
+            return run_status == "cloud.smarthq.type.runstatus.delayed"
+
+        # 3. Non-laundry devices: fall back to service-level disabled flag
+        svc_state = services.get(self._service_id) or {}
+        if not svc_state:
+            return True  # No snapshot yet — optimistic
+        return not svc_state.get("disabled", False)
+
+    async def async_press(self) -> None:
+        client = self._client or _bucket(self.hass, self._entry).get("client")
+        if not client:
+            _LOGGER.error("[TRIGGER] WebSocket client not available")
+            return
+        try:
+            await client.async_send_service_command(
+                device_id=self._device_id,
+                service=self._svc,
+                command_type=CMD_TRIGGER_DO,
+                command_params={},
+            )
+            _LOGGER.info("[TRIGGER] ✓ Sent trigger.do for %s", self._attr_name)
+        except Exception as exc:
+            _LOGGER.error("[TRIGGER] ✗ Failed for %s: %s", self._attr_name, exc)
+
+
+class SmartHQHotWaterPresetButton(_SmartHQButtonBase):
+    """Button that sets the refrigerator hot water dispenser to a fixed preset.
+
+    Mirrors the SmartHQ app's Cocoa/Tea/Soup quick-picks. There is no
+    separate "start heating" command — temperature.set with the target
+    fahrenheit value both stores the setpoint and starts heating.
+    """
+
+    def __init__(self, hass, entry, client, device_id, service_id,
+                 dev_name, label, fahrenheit: int, icon: str, unique_id):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._client = client
+        self._service_id = service_id
+        self._fahrenheit = fahrenheit
+        self._attr_name = f"{dev_name} {label}"
+        self._attr_icon = icon
+
+    async def async_press(self) -> None:
+        client = self._client or _bucket(self.hass, self._entry).get("client")
+        if not client:
+            _LOGGER.error("[HOTWATER_PRESET] WebSocket client not available")
+            return
+        snap = _snapshot_for(self.hass, self._entry, self._device_id)
+        svc = (snap.get("services") or {}).get(self._service_id) or {}
+        try:
+            await client.async_send_service_command(
+                device_id=self._device_id,
+                service=svc,
+                command_type=CMD_TEMPERATURE_SET,
+                command_params={"fahrenheit": self._fahrenheit},
+            )
+            _LOGGER.info("[HOTWATER_PRESET] ✓ Sent %s°F for %s", self._fahrenheit, self._attr_name)
+        except Exception as exc:
+            _LOGGER.error("[HOTWATER_PRESET] ✗ Failed for %s: %s", self._attr_name, exc)
+
+
+class SmartHQFirmwareUpgradeButton(_SmartHQButtonBase):
+    """Button to initiate a firmware upgrade."""
+
+    _attr_icon = "mdi:update"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, hass, entry, client, device_id, service_id,
+                 dev_name, unique_id):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._client = client
+        self._service_id = service_id
+        self._attr_name = f"{dev_name} Start Firmware Upgrade"
+
+    async def async_press(self) -> None:
+        if self._client:
+            await self._client.async_send_service_command(
+                device_id=self._device_id,
+                service_id=self._service_id,
+                command_type=CMD_FIRMWARE_UPGRADE,
+                params={},
+            )
+            _LOGGER.info("[FW_UPGRADE] Sent firmware.v1.upgrade for %s", self._attr_name)
+        else:
+            _LOGGER.error("[FW_UPGRADE] WebSocket client not available")
+
+
+class SmartHQCoffeeBrewerButton(_SmartHQButtonBase):
+    """Coffee Brewer start/stop button."""
+
+    def __init__(self, hass, entry, api, device_id, service_id,
+                 dev_name, command_type, button_type, unique_id):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._api = api
+        self._service_id = service_id
+        self._command_type = command_type
+        self._button_type = button_type
+        self._attr_name = f"{dev_name} Brew {button_type.title()}"
+        self._attr_icon = "mdi:coffee" if button_type == "start" else "mdi:stop"
+
+    async def async_press(self) -> None:
+        bucket = _bucket(self.hass, self._entry)
+        api = self._api or bucket.get("api")
+        if not api:
+            _LOGGER.error("[COFFEE] API not available")
+            return
+
+        # Retrieve service metadata before building parameterized commands.
+        snap = _snapshot_for(self.hass, self._entry, self._device_id)
+        svc = (snap.get("services") or {}).get(self._service_id) or {}
+        command: Dict[str, Any] = {"commandType": self._command_type}
+
+        if self._button_type == "start":
+            # Only include parameters the user actually touched via the
+            # coffee_* selects, so untouched fields fall back to the
+            # device's own defaults instead of a hardcoded value (#52).
+            # Pending selections superseded by a live device change (e.g. the
+            # user changed cups directly on the machine after picking a value
+            # in HA) are dropped first so they can't override it (#61).
+            settings = (bucket.get("coffee_brewer_settings") or {}).get(self._device_id, {})
+            from .select import _reconcile_coffee_settings
+            _reconcile_coffee_settings(settings, svc)
+            if "strength" in settings:
+                command["strength"] = settings["strength"]
+            if "size_value" in settings:
+                size_kind = settings.get("size_kind", "carafe")
+                volume_key = "volumeCarafe" if size_kind == "carafe" else "volumeSingle"
+                command[volume_key] = settings["size_value"]
+                command["volumeUnits"] = settings.get(
+                    "size_units", "cloud.smarthq.type.volumeunits.fluidounces"
+                )
+            if "temperature" in settings:
+                try:
+                    command["temperatureCelsius"] = float(settings["temperature"].replace("°C", ""))
+                except (ValueError, AttributeError):
+                    pass
+            if "temperature_f" in settings:
+                command["temperatureFahrenheit"] = settings["temperature_f"]
+                command.pop("temperatureCelsius", None)
+            if "bloom" in settings:
+                cfg = svc.get("config") or {}
+                if cfg.get("bloomDwellTimeSupported") in {
+                    "cloud.smarthq.type.parameter.required",
+                    "cloud.smarthq.type.parameter.optional",
+                    "cloud.smarthq.type.parameter.defaulted",
+                }:
+                    command["bloomDwellTimeSeconds"] = settings["bloom"]
+                if cfg.get("bloomPumpRunTimeSupported") in {
+                    "cloud.smarthq.type.parameter.required",
+                    "cloud.smarthq.type.parameter.optional",
+                    "cloud.smarthq.type.parameter.defaulted",
+                }:
+                    command["bloomPumpRunTimeSeconds"] = settings["bloom"]
+            if "grind" in settings:
+                command["grindTimeDelta"] = settings["grind"]
+
+        await api.async_send_command(
+            device_id=self._device_id,
+            service_type=svc.get("serviceType", ""),
+            domain_type=svc.get("domainType", ""),
+            service_device_type=svc.get("serviceDeviceType", ""),
+            command=command,
+        )
+        _LOGGER.info("[COFFEE] ✓ Sent %s command", self._button_type.upper())
+
+
+class SmartHQStartCookingButton(_SmartHQButtonBase):
+    """Button to send all pending cooking parameters to the device.
+
+    Replaces the device-type-specific SmartHQSendToSmoker.
+    Works for any device that has cooking.mode.v1 food-domain services.
+    """
+
+    _attr_icon = "mdi:play-circle"
+
+    def __init__(self, hass, entry, client, device_id, dev_name, unique_id, is_smoker_style: bool = False):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._client = client
+        self._is_smoker_style = is_smoker_style
+        # Smoker keeps the familiar "Send To Smoker" label; all other cooking
+        # devices (Toaster Oven, Oven, etc.) use the generic "Start Cooking" label.
+        if is_smoker_style:
+            self._attr_name = f"{dev_name} Send To Smoker"
+        else:
+            self._attr_name = f"{dev_name} Start Cooking"
+
+    @property
+    def available(self) -> bool:
+        """Available as long as the device is known (snapshot exists).
+        The user can pre-configure all parameters before powering on, mirroring
+        the SmartHQ app behaviour where NEW SMOKE is accessible at any time.
+        """
+        snap = _snapshot_for(self.hass, self._entry, self._device_id)
+        return bool(snap)
+
+    async def async_press(self) -> None:
+        bucket = _bucket(self.hass, self._entry)
+        client = self._client or bucket.get("client")
+        if not client:
+            _LOGGER.error("[START_COOKING] WebSocket client not available")
+            return
+
+        pending_modes = bucket.get("pending_cook_modes") or {}
+        mode_info = pending_modes.get(self._device_id) or {}
+        pending_params = bucket.get("pending_cook_params") or {}
+        device_params = pending_params.get(self._device_id) or {}
+
+        mode_token = mode_info.get("mode_token")
+        temp_value = device_params.get("smoker_temp_f")
+        is_probe_based = device_params.get("is_probe_based", True)
+        probe_target = device_params.get("probe_target_f") if is_probe_based else None
+        timer_value = device_params.get("cook_time_min") if not is_probe_based else None
+        smoke_level = device_params.get("smoke_level")
+        auto_keep_warm = device_params.get("auto_keep_warm")
+        doneness_level = device_params.get("doneness_level")
+        cook_option = device_params.get("cook_option")
+        numeric_option = device_params.get("numeric_option")
+
+        if not mode_token:
+            # Fallback: read current mode from WS snapshot cooking.state
+            snap = _snapshot_for(self.hass, self._entry, self._device_id)
+            for st in (snap.get("services") or {}).values():
+                if isinstance(st, dict) and st.get("serviceType") == "cloud.smarthq.service.cooking.state.v1":
+                    mode_token = str(st.get("mode") or "")
+                    break
+
+        if not mode_token:
+            _LOGGER.error("[START_COOKING] No cook mode selected or active")
+            return
+
+        # ── Warm mode: read cavity temp & cook time from warm.auto snapshot ─
+        # For cooking.warm, the temperature/time come from warm.auto services,
+        # not from the main cook params (which default to probe-based).
+        if "cooking.warm" in mode_token and (temp_value is None or timer_value is None):
+            from .service_registry import TEMPERATURE_SERVICE, INTEGER_SERVICE
+            WARM_AUTO_DOM = "cloud.smarthq.domain.cooking.warm.auto"
+            snap = _snapshot_for(self.hass, self._entry, self._device_id)
+            for sid, svc_snap in (snap.get("services") or {}).items():
+                if not isinstance(svc_snap, dict):
+                    continue
+                if svc_snap.get("domainType") != WARM_AUTO_DOM:
+                    continue
+                stype = svc_snap.get("serviceType") or ""
+                sdev  = svc_snap.get("serviceDeviceType") or ""
+                if stype == TEMPERATURE_SERVICE and "device.smoker" in sdev:
+                    if temp_value is None:
+                        temp_value = svc_snap.get("fahrenheit")
+                elif stype == INTEGER_SERVICE and "device.smoker" in sdev:
+                    if timer_value is None:
+                        raw_min = svc_snap.get("value")
+                        if raw_min is not None:
+                            timer_value = int(raw_min)
+            _LOGGER.info(
+                "[START_COOKING] Warm mode params from warm.auto snapshot: temp=%s°F duration=%smin",
+                temp_value, timer_value,
+            )
+
+        _LOGGER.info(
+            "[START_COOKING] Device %s: mode=%s temp=%s timer=%s probe=%s smoke=%s "
+            "probe_based=%s warm=%s doneness=%s option=%s numeric=%s",
+            self._device_id[:8], mode_token, temp_value, timer_value,
+            probe_target, smoke_level, is_probe_based, auto_keep_warm,
+            doneness_level, cook_option, numeric_option,
+        )
+
+        try:
+            await client.async_set_cooking_mode(
+                self._device_id,
+                None,
+                mode_token,
+                cavity_temp_f=temp_value,
+                cook_time_minutes=timer_value,
+                probe_temp_f=probe_target,
+                smoke_level=smoke_level,
+                auto_keep_warm=auto_keep_warm,
+                doneness_level=doneness_level,
+                cook_option=cook_option,
+                numeric_option=numeric_option,
+            )
+            _LOGGER.info("[START_COOKING] ✓ Settings sent to device %s", self._device_id[:8])
+
+            # Persist last sent mode; clear one-shot pending params
+            if mode_token:
+                bucket.setdefault("pending_cook_modes", {}).setdefault(
+                    self._device_id, {}
+                )["last_sent_mode"] = mode_token
+                mode_info.pop("mode_token", None)
+            if device_params:
+                pending_params.pop(self._device_id, None)
+
+        except Exception as exc:
+            _LOGGER.error("[START_COOKING] Failed: %s", exc, exc_info=True)
+
+    async def _send_auto_warm_params(self, client) -> None:
+        """Send warm.auto temperature and duration via their own service commands."""
+        from .service_registry import TEMPERATURE_SERVICE, INTEGER_SERVICE
+        CMD_TEMP_SET   = "cloud.smarthq.command.temperature.set"
+        CMD_INT_SET    = "cloud.smarthq.command.integer.set"
+        WARM_AUTO_DOM  = "cloud.smarthq.domain.cooking.warm.auto"
+
+        bucket = _bucket(self.hass, self._entry)
+        coordinator = bucket.get("coordinator")
+        if not coordinator or not coordinator.data:
+            _LOGGER.debug("[AUTO_WARM] No coordinator data available")
+            return
+        dev_data = coordinator.data.get(self._device_id) or {}
+        services = (dev_data.get("item") or {}).get("services") or []
+        snap = _snapshot_for(self.hass, self._entry, self._device_id)
+
+        _LOGGER.debug("[AUTO_WARM] Scanning %d services for warm.auto", len(services))
+
+        for svc in services:
+            if not isinstance(svc, dict):
+                continue
+            if svc.get("domainType") != WARM_AUTO_DOM:
+                continue
+            stype = svc.get("serviceType") or ""
+            sdev  = svc.get("serviceDeviceType") or ""
+            sid   = svc.get("serviceId") or svc.get("id") or ""
+            svc_snap = (snap.get("services") or {}).get(sid) or {}
+
+            _LOGGER.debug("[AUTO_WARM] Found: stype=%s sdev=%s",
+                stype.split(".")[-1], sdev.split(".")[-1])
+
+            # ── warm.auto temperature (device.smoker) ────────────────────────
+            if stype == TEMPERATURE_SERVICE and "device.smoker" in sdev:
+                f_val = svc_snap.get("fahrenheit") or (svc.get("state") or {}).get("fahrenheit")
+                _LOGGER.debug("[AUTO_WARM] temp f_val=%s", f_val)
+                if f_val is not None:
+                    try:
+                        await client.async_send_service_command(
+                            device_id=self._device_id,
+                            service=svc,
+                            command_type=CMD_TEMP_SET,
+                            command_params={"fahrenheit": float(f_val)},
+                        )
+                        _LOGGER.info("[START_COOKING] ✓ warm.auto temp sent: %s°F", f_val)
+                    except Exception as exc:
+                        _LOGGER.error("[START_COOKING] warm.auto temp failed: %s", exc)
+
+            # ── warm.auto integer duration (device.smoker) ───────────────────
+            elif stype == INTEGER_SERVICE and "device.smoker" in sdev:
+                val = svc_snap.get("value") or (svc.get("state") or {}).get("value")
+                _LOGGER.debug("[AUTO_WARM] duration val=%s", val)
+                if val is not None:
+                    try:
+                        await client.async_send_service_command(
+                            device_id=self._device_id,
+                            service=svc,
+                            command_type=CMD_INT_SET,
+                            command_params={"value": int(val)},
+                        )
+                        _LOGGER.info("[START_COOKING] ✓ warm.auto duration sent: %s min", val)
+                    except Exception as exc:
+                        _LOGGER.error("[START_COOKING] warm.auto duration failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Dishwasher state command buttons (start / stop / pause)
+# ---------------------------------------------------------------------------
+
+class SmartHQDishwasherStateButton(_SmartHQButtonBase):
+    """Button to send a dishwasher.state.v1 command (start/stop/pause)."""
+
+    def __init__(self, hass, entry, ws, device_id, service_id, dev_name, label, command_type, unique_id):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._ws = ws
+        self._service_id = service_id
+        self._command_type = command_type
+        self._attr_name = f"{dev_name} Dishwasher {label}"
+        self._attr_icon = {
+            "Start": "mdi:play",
+            "Stop":  "mdi:stop",
+            "Pause": "mdi:pause",
+        }.get(label, "mdi:gesture-tap-button")
+
+    async def async_press(self) -> None:
+        _LOGGER.info("[DISHWASHER_BTN] %s: %s", self._attr_name, self._command_type)
+        try:
+            await self._ws.async_dishwasher_state_command(
+                device_id=self._device_id,
+                service_id=self._service_id,
+                command_type=self._command_type,
+            )
+        except Exception as exc:
+            _LOGGER.error("[DISHWASHER_BTN] Failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Advantium command buttons (start / stop / pause / resume)
+# ---------------------------------------------------------------------------
+
+class SmartHQAdvantiumButton(_SmartHQButtonBase):
+    """Button to send a cooking.advantium command (start/stop/pause/resume)."""
+
+    def __init__(self, hass, entry, ws, device_id, service_id, dev_name, label, command_type, icon, unique_id):
+        super().__init__(hass, entry, device_id, dev_name, unique_id)
+        self._ws = ws
+        self._service_id = service_id
+        self._command_type = command_type
+        self._attr_name = f"{dev_name} Advantium {label}"
+        self._attr_icon = icon
+
+    async def async_press(self) -> None:
+        _LOGGER.info("[ADVANTIUM_BTN] %s: %s", self._attr_name, self._command_type)
+        try:
+            await self._ws.async_advantium_command(
+                device_id=self._device_id,
+                service_id=self._service_id,
+                command_type=self._command_type,
+            )
+        except Exception as exc:
+            _LOGGER.error("[ADVANTIUM_BTN] Failed: %s", exc, exc_info=True)

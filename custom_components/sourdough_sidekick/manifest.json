@@ -1,0 +1,19 @@
+{
+  "domain": "sourdough_sidekick",
+  "name": "Sourdough Sidekick",
+  "codeowners": [
+    "@FutureGUIs"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "application_credentials"
+  ],
+  "documentation": "https://github.com/FutureGUIs/sourdough-sidekick",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/FutureGUIs/sourdough-sidekick/issues",
+  "loggers": [
+    "custom_components.sourdough_sidekick"
+  ],
+  "version": "1.6.0"
+}

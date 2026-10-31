@@ -1,0 +1,22 @@
+name: Bug report
+description: Report an integration problem
+title: '[Bug] '
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Home Assistant and integration versions
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include expected behavior and reproduction steps. Never include tokens, passwords, client secrets, or unredacted account dumps.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted error details
+      render: text

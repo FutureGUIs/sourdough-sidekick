@@ -1,0 +1,61 @@
+blueprint:
+  name: Sourdough Sidekick ready and discard notifications
+  description: >-
+    Notify when the Sidekick reports completion or a full crock. Initial unknown
+    readings are ignored. Choose your notification actions; sidekick_message
+    contains the event message. This blueprint sends no appliance commands.
+  domain: automation
+  input:
+    starter_status:
+      name: Starter Status sensor
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              integration: sourdough_sidekick
+    full_alert:
+      name: Crock Full alert sensor (optional)
+      description: Select the cloud crock.full alert entity if your device exposes it.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: binary_sensor
+              integration: sourdough_sidekick
+    notification_actions:
+      name: Notification actions
+      description: >-
+        Defaults to a Home Assistant persistent notification. You can choose a
+        mobile notification action and use {{ sidekick_message }} as its message.
+      default:
+        - action: persistent_notification.create
+          data:
+            title: Sourdough Sidekick
+            message: '{{ sidekick_message }}'
+      selector:
+        action: {}
+triggers:
+  - trigger: state
+    entity_id: !input starter_status
+    to: complete
+    id: ready
+  - trigger: state
+    entity_id: !input full_alert
+    to: 'on'
+    id: full
+conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.from_state is not none and
+         trigger.from_state.state not in ['unknown', 'unavailable'] }}
+variables:
+  sidekick_message: >-
+    {% if trigger.id == 'ready' %}
+      Your sourdough starter has reached its goal. Check your Sidekick.
+    {% else %}
+      The Sidekick reports a full crock. Check whether it is time to use or discard starter.
+    {% endif %}
+actions: !input notification_actions
+mode: queued
+max: 5

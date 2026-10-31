@@ -1,0 +1,96 @@
+{
+  "title": "Sourdough Sidekick",
+  "config": {
+    "step": {
+      "pick_implementation": {
+        "title": "Connect Sourdough Sidekick",
+        "description": "Link your Sidekick using your SmartHQ account. Select **Link** to sign in and authorize Home Assistant."
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Sourdough Sidekick",
+        "description": "Sign in to your SmartHQ account again to restore the Sidekick connection."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "This integration can only be added once.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Sourdough Sidekick options",
+        "description": "Configure display and assistant conveniences. The Telegram bridge and conversation agent are optional and only used if you enable them.\n\n{setup_status}",
+        "data": {
+          "show_alt_temperature_units": "Show alternative temperature units",
+          "auto_expose_entities": "Expose appliances to Assist (voice/text control)",
+          "enable_telegram_bridge": "Enable Telegram control",
+          "conversation_agent": "Conversation agent (for Telegram)",
+          "telegram_allowed_chat_ids": "Allowed Telegram chat IDs (comma separated)"
+        },
+        "data_description": {
+          "conversation_agent": "Pick the conversation agent to use. Sourdough Sidekick will automatically enable its appliance tools on that agent, so you don't have to toggle it in the agent's own settings.",
+          "telegram_allowed_chat_ids": "Only these Telegram chat IDs may control your appliances. Leave blank to rely solely on the Telegram bot's own allow-list."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "ambient_temperature": {
+        "name": "Ambient Temperature"
+      },
+      "cavity_temperature": {
+        "name": "Cavity Temperature"
+      },
+      "probe_temperature": {
+        "name": "Probe Temperature"
+      },
+      "target_temperature": {
+        "name": "Target Temperature"
+      },
+      "cavity_target_temperature": {
+        "name": "Cavity Target Temperature"
+      },
+      "probe_target_temperature": {
+        "name": "Probe Target Temperature"
+      },
+      "brew_temperature": {
+        "name": "Brew Temperature"
+      },
+      "battery_level": {
+        "name": "Battery Level"
+      },
+      "cook_time_remaining": {
+        "name": "Cook Time Remaining"
+      },
+      "cycle_time_remaining": {
+        "name": "Cycle Time Remaining"
+      },
+      "time_remaining": {
+        "name": "Time Remaining"
+      },
+      "humidity": {
+        "name": "Humidity"
+      },
+      "temperature": {
+        "name": "Temperature"
+      },
+      "volatile_organic_compounds": {
+        "name": "Volatile Organic Compounds"
+      },
+      "pm25": {
+        "name": "PM2.5"
+      },
+      "pm10": {
+        "name": "PM10"
+      },
+      "pm1": {
+        "name": "PM1"
+      },
+      "aqi": {
+        "name": "AQI"
+      }
+    }
+  }
+}
