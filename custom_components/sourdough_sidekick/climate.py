@@ -184,7 +184,7 @@ class SmartHQThermostatClimate(ClimateEntity):
 
     _attr_should_poll = False
     _attr_has_entity_name = True
-    _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
+    _attr_native_temperature_unit = UnitOfTemperature.FAHRENHEIT
 
     def __init__(
         self,
@@ -295,8 +295,8 @@ class SmartHQThermostatClimate(ClimateEntity):
         if power is not None:
             return power > _COMPRESSOR_POWER_THRESHOLD_W
 
-        current = self.current_temperature
-        target = self.target_temperature
+        current = self.native_current_temperature
+        target = self.native_target_temperature
         if current is None or target is None:
             return True
         if self.hvac_mode == HVACMode.HEAT:
@@ -304,7 +304,7 @@ class SmartHQThermostatClimate(ClimateEntity):
         return current > target
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         # thermostat.v1 doesn't expose a measured temperature field, but the
         # same device typically publishes a sibling `service.temperature`
         # service with a `fahrenheit` reading (surfaced as the "Ambient
@@ -335,7 +335,7 @@ class SmartHQThermostatClimate(ClimateEntity):
         return preferred if preferred is not None else fallback
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         st = self._get_state()
         mode = self.hvac_mode
         if mode == HVACMode.COOL:

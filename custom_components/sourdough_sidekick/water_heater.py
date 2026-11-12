@@ -137,7 +137,7 @@ class SmartHQWaterHeater(WaterHeaterEntity):
 
     _attr_should_poll = False
     _attr_has_entity_name = True
-    _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
+    _attr_native_temperature_unit = UnitOfTemperature.FAHRENHEIT
     _attr_supported_features = (
         WaterHeaterEntityFeature.TARGET_TEMPERATURE
         | WaterHeaterEntityFeature.OPERATION_MODE
@@ -185,11 +185,11 @@ class SmartHQWaterHeater(WaterHeaterEntity):
         return _MODE_MAP.get(token)
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         return None  # waterheater.v1 doesn't expose measured temp
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         st = self._get_state()
         return st.get("setpointFahrenheit") or st.get("setpointFahrenheitConverted")
 

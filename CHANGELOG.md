@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1
+
+- Climate and water heater entities use the `native_` temperature properties introduced in Home Assistant 2026.11, removing the deprecation warnings ahead of the 2027.11 removal.
+- Minimum Home Assistant version is now 2026.11.0.
+
 ## 1.6.0
 
 - Dedicated `sourdough_sidekick` integration domain and folder.
